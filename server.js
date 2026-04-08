@@ -127,3 +127,50 @@ app.get("/analytics", async (_req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+
+app.get("/claude-summary", async (req, res) => {
+  try {
+    const analyticsRes = await fetch("https://shopify-analytics-production-b0c3.up.railway.app/analytics");
+    const analyticsData = await analyticsRes.json();
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-3-sonnet-20240229",
+        max_tokens: 600,
+        messages: [
+          {
+            role: "user",
+            content: `You are a Shopify analytics expert.
+
+Analyze this store data and give:
+- Business summary
+- Top products
+- Customer insights
+- Weak areas
+- 3 actionable recommendations
+
+Data:
+${JSON.stringify(analyticsData, null, 2)}`
+          }
+        ]
+      }),
+    });
+
+    const data = await response.json();
+
+    // Return only Claude's text (clean output)
+    const text = data?.content?.[0]?.text || "No response";
+
+    res.send(text);
+
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
