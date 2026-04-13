@@ -180,7 +180,28 @@ ${JSON.stringify(analyticsData, null, 2)}`
       .map(block => block.text)
       .join("\n\n");
 
-    res.send(text || "Anthropic returned no text.");
+res.send(`
+<html>
+  <head>
+    <title>AI Shopify Report</title>
+    <style>
+      body { font-family: Arial; padding: 20px; background: #f5f5f5; }
+      h1 { color: #333; }
+      pre {
+        white-space: pre-wrap;
+        background: #fff;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>📊 AI Shopify Insights</h1>
+    <pre>${text}</pre>
+  </body>
+</html>
+`);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
