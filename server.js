@@ -24,7 +24,12 @@ async function shopifyQuery(query) {
     throw new Error(`Shopify HTTP ${res.status}: ${text}`);
   }
 
-  const data = JSON.parse(text);
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid Shopify JSON response: ${text}`);
+  }
 
   if (data.errors) {
     throw new Error(JSON.stringify(data.errors));
@@ -124,12 +129,7 @@ app.get("/analytics", async (_req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-
-app.get("/claude-summary", async (req, res) => {
+app.get("/claude-summary", async (_req, res) => {
   try {
     const analyticsRes = await fetch("https://shopify-analytics-production-b0c3.up.railway.app/analytics");
     const analyticsData = await analyticsRes.json();
@@ -139,38 +139,53 @@ app.get("/claude-summary", async (req, res) => {
       headers: {
         "x-api-key": process.env.ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
+        "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-3-sonnet-20240229",
+        model: "claude-sonnet-4-6",
         max_tokens: 600,
+        system: "You are a Shopify analytics expert. Give concise and practical business insights.",
         messages: [
           {
             role: "user",
-            content: `You are a Shopify analytics expert.
-
-Analyze this store data and give:
-- Business summary
-- Top products
-- Customer insights
-- Weak areas
-- 3 actionable recommendations
+            content: `Analyze this Shopify analytics data and return:
+1. Business summary
+2. Top products
+3. Repeat customer insight
+4. Weak areas
+5. 3 action items
 
 Data:
 ${JSON.stringify(analyticsData, null, 2)}`
           }
         ]
-      }),
+      })
     });
 
-    const data = await response.json();
+    const raw = await response.text();
 
-    // Return only Claude's text (clean output)
-    const text = data?.content?.[0]?.text || "No response";
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return res.status(500).send(`Anthropic returned non-JSON response: ${raw}`);
+    }
 
-    res.send(text);
+    if (!response.ok) {
+      return res.status(response.status).json(data);
+    }
 
+    const text = (data.content || [])
+      .filter(block => block.type === "text")
+      .map(block => block.text)
+      .join("\n\n");
+
+    res.send(text || "Anthropic returned no text.");
   } catch (error) {
-    res.json({ error: error.message });
+    res.status(500).json({ error: error.message });
   }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
