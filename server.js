@@ -11,10 +11,16 @@ const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 // ─── CORS ────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  // 🔥 IMPORTANT: handle preflight requests
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
   next();
 });
-
 // ─── Shopify GraphQL helper ──────────────────────────────────────────────────
 async function shopifyQuery(query) {
   const res = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
