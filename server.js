@@ -5,23 +5,19 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SHOP = process.env.SHOPIFY_STORE;
-const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
-const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 
-// ─── Basic validation ────────────────────────────────────────────────────────
-if (!SHOP) {
-  throw new Error("Missing SHOPIFY_STORE in environment variables.");
-}
-if (!CLIENT_ID) {
-  throw new Error("Missing SHOPIFY_CLIENT_ID in environment variables.");
-}
-if (!CLIENT_SECRET) {
-  throw new Error("Missing SHOPIFY_CLIENT_SECRET in environment variables.");
-}
+// Auth mode 1: direct token
+const STATIC_TOKEN = process.env.SHOPIFY_TOKEN || "";
 
-// ─── CORS ────────────────────────────────────────────────────────────────────
+// Auth mode 2: Dev Dashboard client credentials
+const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || "";
+const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || "";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORS
+// ─────────────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -36,16 +32,80 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// ─── Shopify token cache ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function hasStaticTokenAuth() {
+  return Boolean(SHOP && STATIC_TOKEN);
+}
+
+function hasClientCredentialsAuth() {
+  return Boolean(SHOP && CLIENT_ID && CLIENT_SECRET);
+}
+
+function getAuthMode() {
+  if (hasStaticTokenAuth()) return "static_token";
+  if (hasClientCredentialsAuth()) return "client_credentials";
+  return "missing";
+}
+
+function getConfigStatus() {
+  return {
+    shopConfigured: Boolean(SHOP),
+    staticTokenConfigured: Boolean(STATIC_TOKEN),
+    clientIdConfigured: Boolean(CLIENT_ID),
+    clientSecretConfigured: Boolean(CLIENT_SECRET),
+    anthropicConfigured: Boolean(ANTHROPIC_API_KEY),
+    authMode: getAuthMode(),
+    apiVersion: API_VERSION,
+  };
+}
+
+function buildConfigError() {
+  const status = getConfigStatus();
+
+  return {
+    error: "Shopify backend is not fully configured.",
+    details: {
+      shopifyStore: status.shopConfigured ? "present" : "missing",
+      shopifyToken: status.staticTokenConfigured ? "present" : "missing",
+      shopifyClientId: status.clientIdConfigured ? "present" : "missing",
+      shopifyClientSecret: status.clientSecretConfigured ? "present" : "missing",
+      authMode: status.authMode,
+      message:
+        "Set either SHOPIFY_TOKEN OR both SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET, plus SHOPIFY_STORE.",
+    },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shopify token cache for client credentials mode
+// ─────────────────────────────────────────────────────────────────────────────
 let tokenCache = {
   accessToken: null,
   expiresAtMs: 0,
 };
 
 async function getShopifyAccessToken() {
+  if (!SHOP) {
+    throw new Error("Missing SHOPIFY_STORE.");
+  }
+
+  // If a direct token exists, prefer it.
+  if (STATIC_TOKEN) {
+    return STATIC_TOKEN;
+  }
+
+  // Otherwise use client credentials flow.
+  if (!CLIENT_ID || !CLIENT_SECRET) {
+    throw new Error(
+      "Missing Shopify auth. Provide SHOPIFY_TOKEN or both SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET."
+    );
+  }
+
   const now = Date.now();
 
-  // Refresh 60 seconds early to avoid edge-of-expiry failures
+  // Reuse cached token until shortly before expiry.
   if (tokenCache.accessToken && tokenCache.expiresAtMs - 60_000 > now) {
     return tokenCache.accessToken;
   }
@@ -62,18 +122,18 @@ async function getShopifyAccessToken() {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      "Accept": "application/json",
+      Accept: "application/json",
     },
     body: body.toString(),
   });
 
   const text = await res.text();
-  let data;
 
+  let data;
   try {
     data = JSON.parse(text);
   } catch {
-    throw new Error(`Invalid token response from Shopify: ${text}`);
+    throw new Error(`Invalid Shopify token response: ${text}`);
   }
 
   if (!res.ok) {
@@ -84,7 +144,6 @@ async function getShopifyAccessToken() {
     throw new Error(`Shopify token response missing access_token: ${text}`);
   }
 
-  // Shopify docs say expires_in is returned and is typically 86399 seconds
   const expiresInSec = Number(data.expires_in || 3600);
 
   tokenCache = {
@@ -95,7 +154,9 @@ async function getShopifyAccessToken() {
   return tokenCache.accessToken;
 }
 
-// ─── Shopify GraphQL helper ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Shopify GraphQL helper
+// ─────────────────────────────────────────────────────────────────────────────
 async function shopifyQuery(query) {
   const accessToken = await getShopifyAccessToken();
 
@@ -104,7 +165,7 @@ async function shopifyQuery(query) {
     headers: {
       "Content-Type": "application/json",
       "X-Shopify-Access-Token": accessToken,
-      "Accept": "application/json",
+      Accept: "application/json",
     },
     body: JSON.stringify({ query }),
   });
@@ -129,37 +190,25 @@ async function shopifyQuery(query) {
   return data;
 }
 
-// ─── Date range resolver ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Date range resolver
+// ─────────────────────────────────────────────────────────────────────────────
 function resolveDateRange(query) {
   const { from, to, days } = query;
 
   if (from) {
     const dateRx = /^\d{4}-\d{2}-\d{2}$/;
-
-    if (!dateRx.test(from)) {
-      throw new Error("Invalid 'from' format. Use YYYY-MM-DD.");
-    }
-
-    if (to && !dateRx.test(to)) {
-      throw new Error("Invalid 'to' format. Use YYYY-MM-DD.");
-    }
+    if (!dateRx.test(from)) throw new Error("Invalid 'from' format. Use YYYY-MM-DD.");
+    if (to && !dateRx.test(to)) throw new Error("Invalid 'to' format. Use YYYY-MM-DD.");
 
     const fromDate = new Date(`${from}T00:00:00.000Z`);
     const toDate = to
       ? new Date(`${to}T23:59:59.999Z`)
       : new Date(`${from}T23:59:59.999Z`);
 
-    if (Number.isNaN(fromDate.getTime())) {
-      throw new Error("Invalid 'from' date.");
-    }
-
-    if (Number.isNaN(toDate.getTime())) {
-      throw new Error("Invalid 'to' date.");
-    }
-
-    if (toDate < fromDate) {
-      throw new Error("'to' must be >= 'from'.");
-    }
+    if (Number.isNaN(fromDate.getTime())) throw new Error("Invalid 'from' date.");
+    if (Number.isNaN(toDate.getTime())) throw new Error("Invalid 'to' date.");
+    if (toDate < fromDate) throw new Error("'to' must be >= 'from'.");
 
     const diffMs = toDate - fromDate;
     const diffDays = Math.max(1, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
@@ -191,7 +240,9 @@ function resolveDateRange(query) {
   };
 }
 
-// ─── Paginated order fetcher ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Paginated order fetcher
+// ─────────────────────────────────────────────────────────────────────────────
 async function fetchAllOrders(sinceISO, untilISO) {
   let allOrders = [];
   let cursor = null;
@@ -201,7 +252,6 @@ async function fetchAllOrders(sinceISO, untilISO) {
 
   while (hasNextPage) {
     const afterClause = cursor ? `, after: "${cursor}"` : "";
-
     const query = `
     {
       orders(first: 250, reverse: true${afterClause}, query: "created_at:>=${sinceISO}${untilClause}") {
@@ -260,7 +310,11 @@ async function fetchAllOrders(sinceISO, untilISO) {
     }`;
 
     const result = await shopifyQuery(query);
-    const page = result.data.orders;
+    const page = result?.data?.orders;
+
+    if (!page) {
+      throw new Error("Unexpected Shopify response: missing orders data.");
+    }
 
     allOrders = allOrders.concat(page.edges.map((e) => e.node));
     hasNextPage = page.pageInfo.hasNextPage;
@@ -270,7 +324,9 @@ async function fetchAllOrders(sinceISO, untilISO) {
   return allOrders;
 }
 
-// ─── Main analytics builder ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Main analytics builder
+// ─────────────────────────────────────────────────────────────────────────────
 function buildAnalytics(orders, range) {
   let totalRevenue = 0;
   let totalDiscount = 0;
@@ -330,15 +386,11 @@ function buildAnalytics(orders, range) {
       const country = addr.country || "Unknown";
       const countryCode = addr.countryCodeV2 || "??";
 
-      if (!cityMap[city]) {
-        cityMap[city] = { count: 0, revenue: 0, country, countryCode };
-      }
+      if (!cityMap[city]) cityMap[city] = { count: 0, revenue: 0, country, countryCode };
       cityMap[city].count++;
       cityMap[city].revenue += amount;
 
-      if (!countryMap[country]) {
-        countryMap[country] = { count: 0, revenue: 0, countryCode };
-      }
+      if (!countryMap[country]) countryMap[country] = { count: 0, revenue: 0, countryCode };
       countryMap[country].count++;
       countryMap[country].revenue += amount;
     }
@@ -405,11 +457,7 @@ function buildAnalytics(orders, range) {
 
   const dailyBreakdown = Object.entries(dailyMap)
     .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([date, d]) => ({
-      date,
-      orders: d.orders,
-      revenue: Math.round(d.revenue),
-    }));
+    .map(([date, d]) => ({ date, orders: d.orders, revenue: Math.round(d.revenue) }));
 
   const peakHour = hourMap.indexOf(Math.max(...hourMap));
 
@@ -487,35 +535,61 @@ function buildAnalytics(orders, range) {
   };
 }
 
-// ─── Routes ──────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Routes
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/", async (_req, res) => {
+  const status = getConfigStatus();
+
+  if (!SHOP) {
+    return res.status(500).json(buildConfigError());
+  }
+
   try {
-    // Optional lightweight token check
     await getShopifyAccessToken();
-    res.send("Vitality Analytics Backend — OK");
+
+    return res.json({
+      ok: true,
+      message: "Vitality Analytics Backend — OK",
+      authMode: status.authMode,
+      apiVersion: status.apiVersion,
+    });
   } catch (error) {
-    res.status(500).send(`Backend up, Shopify auth failed: ${error.message}`);
+    return res.status(500).json({
+      ok: false,
+      message: "Backend is up, but Shopify auth failed.",
+      authMode: status.authMode,
+      error: error.message,
+    });
   }
 });
 
 app.get("/analytics", async (req, res) => {
+  if (getAuthMode() === "missing") {
+    return res.status(500).json(buildConfigError());
+  }
+
   try {
     const range = resolveDateRange(req.query);
     const orders = await fetchAllOrders(range.sinceISO, range.untilISO);
     const analytics = buildAnalytics(orders, range);
-    res.json(analytics);
+    return res.json(analytics);
   } catch (error) {
     console.error("Analytics error:", error);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
 app.get("/claude-summary", async (req, res) => {
-  try {
-    if (!ANTHROPIC_API_KEY) {
-      return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY" });
-    }
+  if (getAuthMode() === "missing") {
+    return res.status(500).json(buildConfigError());
+  }
 
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY." });
+  }
+
+  try {
     const range = resolveDateRange(req.query);
     const orders = await fetchAllOrders(range.sinceISO, range.untilISO);
     const analyticsData = buildAnalytics(orders, range);
@@ -582,7 +656,7 @@ Data:
       .map((b) => b.text)
       .join("\n\n");
 
-    res.json({
+    return res.json({
       days: range.days,
       rangeType: range.rangeType,
       rangeLabel: range.label,
@@ -592,7 +666,7 @@ Data:
     });
   } catch (error) {
     console.error("Claude summary error:", error);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
