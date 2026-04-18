@@ -5,8 +5,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SHOP = process.env.SHOPIFY_STORE;
-const TOKEN = process.env.SHOPIFY_TOKEN;
+const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+// ─── Basic validation ────────────────────────────────────────────────────────
+if (!SHOP) {
+  throw new Error("Missing SHOPIFY_STORE in environment variables.");
+}
+if (!CLIENT_ID) {
+  throw new Error("Missing SHOPIFY_CLIENT_ID in environment variables.");
+}
+if (!CLIENT_SECRET) {
+  throw new Error("Missing SHOPIFY_CLIENT_SECRET in environment variables.");
+}
 
 // ─── CORS ────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -14,58 +27,142 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-  // 🔥 IMPORTANT: handle preflight requests
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
 
   next();
 });
+
+app.use(express.json());
+
+// ─── Shopify token cache ─────────────────────────────────────────────────────
+let tokenCache = {
+  accessToken: null,
+  expiresAtMs: 0,
+};
+
+async function getShopifyAccessToken() {
+  const now = Date.now();
+
+  // Refresh 60 seconds early to avoid edge-of-expiry failures
+  if (tokenCache.accessToken && tokenCache.expiresAtMs - 60_000 > now) {
+    return tokenCache.accessToken;
+  }
+
+  const tokenUrl = `https://${SHOP}/admin/oauth/access_token`;
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+  });
+
+  const res = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "application/json",
+    },
+    body: body.toString(),
+  });
+
+  const text = await res.text();
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid token response from Shopify: ${text}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(`Shopify token request failed (${res.status}): ${text}`);
+  }
+
+  if (!data.access_token) {
+    throw new Error(`Shopify token response missing access_token: ${text}`);
+  }
+
+  // Shopify docs say expires_in is returned and is typically 86399 seconds
+  const expiresInSec = Number(data.expires_in || 3600);
+
+  tokenCache = {
+    accessToken: data.access_token,
+    expiresAtMs: now + expiresInSec * 1000,
+  };
+
+  return tokenCache.accessToken;
+}
+
 // ─── Shopify GraphQL helper ──────────────────────────────────────────────────
 async function shopifyQuery(query) {
+  const accessToken = await getShopifyAccessToken();
+
   const res = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": TOKEN
+      "X-Shopify-Access-Token": accessToken,
+      "Accept": "application/json",
     },
-    body: JSON.stringify({ query })
+    body: JSON.stringify({ query }),
   });
 
   const text = await res.text();
-  if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${text}`);
+
+  if (!res.ok) {
+    throw new Error(`Shopify HTTP ${res.status}: ${text}`);
+  }
 
   let data;
-  try { data = JSON.parse(text); }
-  catch { throw new Error(`Invalid Shopify JSON: ${text}`); }
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid Shopify JSON: ${text}`);
+  }
 
-  if (data.errors) throw new Error(JSON.stringify(data.errors));
+  if (data.errors) {
+    throw new Error(JSON.stringify(data.errors));
+  }
+
   return data;
 }
 
 // ─── Date range resolver ─────────────────────────────────────────────────────
-// Returns { sinceISO, untilISO, label, rangeType }
-// Priority: from/to params > days param
 function resolveDateRange(query) {
   const { from, to, days } = query;
 
   if (from) {
-    // Validate format YYYY-MM-DD
     const dateRx = /^\d{4}-\d{2}-\d{2}$/;
-    if (!dateRx.test(from)) throw new Error("Invalid 'from' format. Use YYYY-MM-DD.");
-    if (to && !dateRx.test(to)) throw new Error("Invalid 'to' format. Use YYYY-MM-DD.");
 
-    const fromDate = new Date(from + "T00:00:00.000Z");
+    if (!dateRx.test(from)) {
+      throw new Error("Invalid 'from' format. Use YYYY-MM-DD.");
+    }
+
+    if (to && !dateRx.test(to)) {
+      throw new Error("Invalid 'to' format. Use YYYY-MM-DD.");
+    }
+
+    const fromDate = new Date(`${from}T00:00:00.000Z`);
     const toDate = to
-      ? new Date(to + "T23:59:59.999Z")
-      : new Date(from + "T23:59:59.999Z"); // default to same day
+      ? new Date(`${to}T23:59:59.999Z`)
+      : new Date(`${from}T23:59:59.999Z`);
 
-    if (isNaN(fromDate.getTime())) throw new Error("Invalid 'from' date.");
-    if (isNaN(toDate.getTime())) throw new Error("Invalid 'to' date.");
-    if (toDate < fromDate) throw new Error("'to' must be >= 'from'.");
+    if (Number.isNaN(fromDate.getTime())) {
+      throw new Error("Invalid 'from' date.");
+    }
+
+    if (Number.isNaN(toDate.getTime())) {
+      throw new Error("Invalid 'to' date.");
+    }
+
+    if (toDate < fromDate) {
+      throw new Error("'to' must be >= 'from'.");
+    }
 
     const diffMs = toDate - fromDate;
-    const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+    const diffDays = Math.max(1, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
 
     return {
       sinceISO: fromDate.toISOString(),
@@ -74,12 +171,11 @@ function resolveDateRange(query) {
       rangeType: "custom",
       from,
       to: to || from,
-      days: diffDays
+      days: diffDays,
     };
   }
 
-  // Fall back to days
-  const numDays = Math.min(parseInt(days) || 7, 365);
+  const numDays = Math.min(parseInt(days, 10) || 7, 365);
   const since = new Date();
   since.setDate(since.getDate() - numDays);
   since.setHours(0, 0, 0, 0);
@@ -91,23 +187,21 @@ function resolveDateRange(query) {
     rangeType: "rolling",
     from: null,
     to: null,
-    days: numDays
+    days: numDays,
   };
 }
 
 // ─── Paginated order fetcher ─────────────────────────────────────────────────
-// Fetches ALL orders within the date window across multiple pages (250/page max)
 async function fetchAllOrders(sinceISO, untilISO) {
   let allOrders = [];
   let cursor = null;
   let hasNextPage = true;
 
-  // Build Shopify query filter — always filter by sinceISO;
-  // if untilISO is provided (custom range), also add upper bound
   const untilClause = untilISO ? ` created_at:<=${untilISO}` : "";
 
   while (hasNextPage) {
     const afterClause = cursor ? `, after: "${cursor}"` : "";
+
     const query = `
     {
       orders(first: 250, reverse: true${afterClause}, query: "created_at:>=${sinceISO}${untilClause}") {
@@ -167,7 +261,8 @@ async function fetchAllOrders(sinceISO, untilISO) {
 
     const result = await shopifyQuery(query);
     const page = result.data.orders;
-    allOrders = allOrders.concat(page.edges.map(e => e.node));
+
+    allOrders = allOrders.concat(page.edges.map((e) => e.node));
     hasNextPage = page.pageInfo.hasNextPage;
     cursor = page.pageInfo.endCursor;
   }
@@ -219,7 +314,7 @@ function buildAnalytics(orders, range) {
     const hour = new Date(order.createdAt).getUTCHours();
     hourMap[hour]++;
 
-    for (const code of (order.discountCodes || [])) {
+    for (const code of order.discountCodes || []) {
       if (code) discountUsage[code] = (discountUsage[code] || 0) + 1;
     }
 
@@ -235,17 +330,22 @@ function buildAnalytics(orders, range) {
       const country = addr.country || "Unknown";
       const countryCode = addr.countryCodeV2 || "??";
 
-      if (!cityMap[city]) cityMap[city] = { count: 0, revenue: 0, country, countryCode };
+      if (!cityMap[city]) {
+        cityMap[city] = { count: 0, revenue: 0, country, countryCode };
+      }
       cityMap[city].count++;
       cityMap[city].revenue += amount;
 
-      if (!countryMap[country]) countryMap[country] = { count: 0, revenue: 0, countryCode };
+      if (!countryMap[country]) {
+        countryMap[country] = { count: 0, revenue: 0, countryCode };
+      }
       countryMap[country].count++;
       countryMap[country].revenue += amount;
     }
 
     if (order.customer?.id) {
       const cid = order.customer.id;
+
       if (!customerMap[cid]) {
         customerMap[cid] = {
           email: order.customer.email,
@@ -257,13 +357,19 @@ function buildAnalytics(orders, range) {
           lastOrderInPeriod: order.createdAt,
           city: order.customer.defaultAddress?.city || null,
           country: order.customer.defaultAddress?.country || null,
-          isRepeat: order.customer.numberOfOrders > 1
+          isRepeat: order.customer.numberOfOrders > 1,
         };
       }
+
       customerMap[cid].ordersInPeriod++;
       customerMap[cid].totalSpentInPeriod += amount;
-      if (order.createdAt < customerMap[cid].firstOrderInPeriod) customerMap[cid].firstOrderInPeriod = order.createdAt;
-      if (order.createdAt > customerMap[cid].lastOrderInPeriod) customerMap[cid].lastOrderInPeriod = order.createdAt;
+
+      if (order.createdAt < customerMap[cid].firstOrderInPeriod) {
+        customerMap[cid].firstOrderInPeriod = order.createdAt;
+      }
+      if (order.createdAt > customerMap[cid].lastOrderInPeriod) {
+        customerMap[cid].lastOrderInPeriod = order.createdAt;
+      }
     }
   }
 
@@ -275,11 +381,22 @@ function buildAnalytics(orders, range) {
   const sortedCities = Object.entries(cityMap)
     .sort((a, b) => b[1].revenue - a[1].revenue)
     .slice(0, 15)
-    .map(([city, d]) => ({ city, country: d.country, countryCode: d.countryCode, orders: d.count, revenue: Math.round(d.revenue) }));
+    .map(([city, d]) => ({
+      city,
+      country: d.country,
+      countryCode: d.countryCode,
+      orders: d.count,
+      revenue: Math.round(d.revenue),
+    }));
 
   const sortedCountries = Object.entries(countryMap)
     .sort((a, b) => b[1].revenue - a[1].revenue)
-    .map(([country, d]) => ({ country, countryCode: d.countryCode, orders: d.count, revenue: Math.round(d.revenue) }));
+    .map(([country, d]) => ({
+      country,
+      countryCode: d.countryCode,
+      orders: d.count,
+      revenue: Math.round(d.revenue),
+    }));
 
   const bestProducts = Object.entries(productCounts)
     .sort((a, b) => b[1] - a[1])
@@ -288,14 +405,18 @@ function buildAnalytics(orders, range) {
 
   const dailyBreakdown = Object.entries(dailyMap)
     .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([date, d]) => ({ date, orders: d.orders, revenue: Math.round(d.revenue) }));
+    .map(([date, d]) => ({
+      date,
+      orders: d.orders,
+      revenue: Math.round(d.revenue),
+    }));
 
   const peakHour = hourMap.indexOf(Math.max(...hourMap));
 
   const topCustomers = Object.values(customerMap)
     .sort((a, b) => b.totalSpentInPeriod - a.totalSpentInPeriod)
     .slice(0, 10)
-    .map(c => ({
+    .map((c) => ({
       email: c.email,
       name: c.name || "Guest",
       ordersInPeriod: c.ordersInPeriod,
@@ -304,14 +425,14 @@ function buildAnalytics(orders, range) {
       city: c.city,
       country: c.country,
       firstOrderInPeriod: c.firstOrderInPeriod,
-      lastOrderInPeriod: c.lastOrderInPeriod
+      lastOrderInPeriod: c.lastOrderInPeriod,
     }));
 
   const topDiscounts = Object.entries(discountUsage)
     .sort((a, b) => b[1] - a[1])
     .map(([code, uses]) => ({ code, uses }));
 
-  const recentOrders = orders.slice(0, 10).map(o => ({
+  const recentOrders = orders.slice(0, 10).map((o) => ({
     orderName: o.name,
     createdAt: o.createdAt,
     amount: parseFloat(o.totalPriceSet?.shopMoney?.amount || 0),
@@ -319,21 +440,20 @@ function buildAnalytics(orders, range) {
     financialStatus: o.displayFinancialStatus,
     fulfillmentStatus: o.displayFulfillmentStatus,
     city: (o.shippingAddress || o.customer?.defaultAddress)?.city || null,
-    country: (o.shippingAddress || o.customer?.defaultAddress)?.country || null
+    country: (o.shippingAddress || o.customer?.defaultAddress)?.country || null,
   }));
 
   const avgOrder = orders.length ? totalRevenue / orders.length : 0;
 
   return {
     meta: {
-      // Always include both days and range info
       days: range.days,
       rangeType: range.rangeType,
       rangeLabel: range.label,
       from: range.from,
       to: range.to,
       totalOrdersFetched: orders.length,
-      generatedAt: new Date().toISOString()
+      generatedAt: new Date().toISOString(),
     },
     summary: {
       totalOrders: orders.length,
@@ -345,7 +465,7 @@ function buildAnalytics(orders, range) {
       currency,
       uniqueCustomers: Object.keys(customerMap).length,
       repeatCustomers: newVsRepeat.repeat,
-      newCustomers: newVsRepeat.new
+      newCustomers: newVsRepeat.new,
     },
     financialStatus: statusMap,
     fulfillmentStatus: fulfillmentMap,
@@ -354,26 +474,30 @@ function buildAnalytics(orders, range) {
     topDiscountCodes: topDiscounts,
     location: {
       byCity: sortedCities,
-      byCountry: sortedCountries
+      byCountry: sortedCountries,
     },
     customerJourney: {
       newVsRepeat,
       peakOrderHour: peakHour,
       peakOrderHourLabel: `${peakHour}:00 – ${peakHour + 1}:00 UTC`,
-      hourlyDistribution: hourMap.map((count, hour) => ({ hour, count }))
+      hourlyDistribution: hourMap.map((count, hour) => ({ hour, count })),
     },
     dailyBreakdown,
-    recentOrders
+    recentOrders,
   };
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
+app.get("/", async (_req, res) => {
+  try {
+    // Optional lightweight token check
+    await getShopifyAccessToken();
+    res.send("Vitality Analytics Backend — OK");
+  } catch (error) {
+    res.status(500).send(`Backend up, Shopify auth failed: ${error.message}`);
+  }
+});
 
-app.get("/", (_req, res) => res.send("Vitality Analytics Backend — OK"));
-
-// GET /analytics?days=7|30|90|180|365
-// GET /analytics?from=YYYY-MM-DD&to=YYYY-MM-DD
-// GET /analytics?from=YYYY-MM-DD  (single day)
 app.get("/analytics", async (req, res) => {
   try {
     const range = resolveDateRange(req.query);
@@ -381,46 +505,47 @@ app.get("/analytics", async (req, res) => {
     const analytics = buildAnalytics(orders, range);
     res.json(analytics);
   } catch (error) {
-    console.error(error);
+    console.error("Analytics error:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /claude-summary?days=7|30|90
-// GET /claude-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
-// GET /claude-summary?from=YYYY-MM-DD  (single day)
 app.get("/claude-summary", async (req, res) => {
   try {
-    const range = resolveDateRange(req.query);
-
-    // Build analytics URL using the same params that were passed in
-    const baseUrl = "https://shopify-analytics-production-b0c3.up.railway.app/analytics";
-    let analyticsUrl;
-    if (range.rangeType === "custom") {
-      analyticsUrl = `${baseUrl}?from=${range.from}&to=${range.to}`;
-    } else {
-      analyticsUrl = `${baseUrl}?days=${range.days}`;
+    if (!ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: "Missing ANTHROPIC_API_KEY" });
     }
 
-    const analyticsRes = await fetch(analyticsUrl);
-    const analyticsData = await analyticsRes.json();
+    const range = resolveDateRange(req.query);
+    const orders = await fetchAllOrders(range.sinceISO, range.untilISO);
+    const analyticsData = buildAnalytics(orders, range);
 
-    const { summary, bestProducts, location, customerJourney, topCustomers, topDiscountCodes, meta } = analyticsData;
+    const {
+      summary,
+      bestProducts,
+      location,
+      customerJourney,
+      topCustomers,
+      topDiscountCodes,
+      meta,
+    } = analyticsData;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
+        "content-type": "application/json",
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-6",
         max_tokens: 800,
-        system: "You are a Shopify analytics expert. Give concise, practical, data-driven insights. Use plain text, no markdown symbols.",
-        messages: [{
-          role: "user",
-          content: `Analyze this Shopify store data for ${meta.rangeLabel} and provide:
+        system:
+          "You are a Shopify analytics expert. Give concise, practical, data-driven insights. Use plain text, no markdown symbols.",
+        messages: [
+          {
+            role: "user",
+            content: `Analyze this Shopify store data for ${meta.rangeLabel} and provide:
 1. Business performance summary
 2. Top products insight
 3. Customer retention insight (new vs repeat)
@@ -434,23 +559,27 @@ Data:
 - Unique customers: ${summary.uniqueCustomers} | New: ${summary.newCustomers} | Repeat: ${summary.repeatCustomers}
 - Cancelled orders: ${summary.cancelledOrders}
 - Total discounts given: ${summary.currency} ${summary.totalDiscount}
-- Top products: ${bestProducts.slice(0,5).map(p => `${p.title} (${p.quantitySold} units)`).join(", ")}
-- Top cities: ${location.byCity.slice(0,5).map(c => `${c.city} (${c.orders} orders)`).join(", ")}
-- Top countries: ${location.byCountry.slice(0,3).map(c => `${c.country} (${c.orders} orders)`).join(", ")}
+- Top products: ${bestProducts.slice(0, 5).map((p) => `${p.title} (${p.quantitySold} units)`).join(", ")}
+- Top cities: ${location.byCity.slice(0, 5).map((c) => `${c.city} (${c.orders} orders)`).join(", ")}
+- Top countries: ${location.byCountry.slice(0, 3).map((c) => `${c.country} (${c.orders} orders)`).join(", ")}
 - Peak order hour: ${customerJourney.peakOrderHourLabel}
 - New vs repeat: ${customerJourney.newVsRepeat.new} new, ${customerJourney.newVsRepeat.repeat} repeat
-- Top discount codes: ${topDiscountCodes.slice(0,3).map(d => `${d.code} (${d.uses}x)`).join(", ") || "none"}
-- Top customers by spend: ${topCustomers.slice(0,3).map(c => `${c.email} (${summary.currency} ${c.totalSpentInPeriod})`).join(", ")}`
-        }]
-      })
+- Top discount codes: ${topDiscountCodes.slice(0, 3).map((d) => `${d.code} (${d.uses}x)`).join(", ") || "none"}
+- Top customers by spend: ${topCustomers.slice(0, 3).map((c) => `${c.email} (${summary.currency} ${c.totalSpentInPeriod})`).join(", ")}`,
+          },
+        ],
+      }),
     });
 
     const raw = await response.json();
-    if (!response.ok) return res.status(response.status).json(raw);
+
+    if (!response.ok) {
+      return res.status(response.status).json(raw);
+    }
 
     const text = (raw.content || [])
-      .filter(b => b.type === "text")
-      .map(b => b.text)
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
       .join("\n\n");
 
     res.json({
@@ -459,12 +588,14 @@ Data:
       rangeLabel: range.label,
       from: range.from,
       to: range.to,
-      summary: text
+      summary: text,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Claude summary error:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
