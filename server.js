@@ -247,37 +247,123 @@ ${JSON.stringify(analytics)}
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
 });
-// ─────────────────────────────────────────────────────────────────────────────
-// MCP ENDPOINT (for Claude connector)
-// ─────────────────────────────────────────────────────────────────────────────
+app.get("/mcp", (_req, res) => {
+  res.status(200).type("text/plain").send("Shopify Analytics MCP server is running");
+});
+
 app.post("/mcp", async (req, res) => {
   try {
-    const { tool, input } = req.body;
+    const body = req.body;
+    const { id, method, params } = body;
 
-    if (tool === "shopify_analytics") {
-      const days = input?.days || 7;
+    if (method === "initialize") {
+      return res.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2024-11-05",
+          capabilities: {
+            tools: {},
+          },
+          serverInfo: {
+            name: "shopify-analytics",
+            version: "1.0.0",
+          },
+        },
+      });
+    }
+
+    if (method === "notifications/initialized") {
+      return res.status(204).send();
+    }
+
+    if (method === "tools/list") {
+      return res.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          tools: [
+            {
+              name: "get_shopify_analytics",
+              description:
+                "Get real Shopify analytics from the Railway backend. Use this for questions about orders, revenue, repeat customers, new customers, and recent performance.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  days: {
+                    type: "number",
+                    description: "Number of days to analyze. Default is 7.",
+                  },
+                  question: {
+                    type: "string",
+                    description: "The user's Shopify analytics question.",
+                  },
+                },
+                required: ["question"],
+              },
+            },
+          ],
+        },
+      });
+    }
+
+    if (method === "tools/call") {
+      const toolName = params?.name;
+      const args = params?.arguments || {};
+
+      if (toolName !== "get_shopify_analytics") {
+        return res.json({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32602,
+            message: "Unknown tool",
+          },
+        });
+      }
+
+      const question = String(args.question || "Give me Shopify analytics");
+      const days = Number(args.days || 7);
 
       const range = resolveDateRange({ days });
       const orders = await fetchAllOrders(range.sinceISO, range.untilISO);
       const analytics = buildAnalytics(orders, range);
 
       return res.json({
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(analytics),
-          },
-        ],
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                question,
+                analytics,
+              }),
+            },
+          ],
+        },
       });
     }
 
-    return res.status(400).json({
-      error: "Unknown tool",
+    return res.json({
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32601,
+        message: `Method not found: ${method}`,
+      },
     });
-  } catch (err) {
-    console.error("MCP error:", err);
+  } catch (error) {
+    console.error("MCP error:", error);
+
     return res.status(500).json({
-      error: "MCP failed",
+      jsonrpc: "2.0",
+      id: req.body?.id || null,
+      error: {
+        code: -32603,
+        message: error.message,
+      },
     });
   }
 });
