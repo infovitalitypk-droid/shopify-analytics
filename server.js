@@ -247,3 +247,37 @@ ${JSON.stringify(analytics)}
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
 });
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP ENDPOINT (for Claude connector)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/mcp", async (req, res) => {
+  try {
+    const { tool, input } = req.body;
+
+    if (tool === "shopify_analytics") {
+      const days = input?.days || 7;
+
+      const range = resolveDateRange({ days });
+      const orders = await fetchAllOrders(range.sinceISO, range.untilISO);
+      const analytics = buildAnalytics(orders, range);
+
+      return res.json({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(analytics),
+          },
+        ],
+      });
+    }
+
+    return res.status(400).json({
+      error: "Unknown tool",
+    });
+  } catch (err) {
+    console.error("MCP error:", err);
+    return res.status(500).json({
+      error: "MCP failed",
+    });
+  }
+});
